@@ -1,1 +1,2 @@
-
+pip install adafruit-circuitpython-scd30 smbus2
+pip install tkinter  # 보통 기본 설치됨
