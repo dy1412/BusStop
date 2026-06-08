@@ -1,8 +1,7 @@
 # ============================================================
-#  버스 공기질 비교 시스템 - 웹앱 버전
+#  버스 공기질 비교 시스템 - 웹앱 버전 (안정화)
 #  라즈베리파이 피코 W + SCD30
 #  당곡고등학교 환경 탐구 프로젝트
-#  대기: 15초마다 / 측정 중: 1초마다 수집
 # ============================================================
 
 import time
@@ -10,23 +9,20 @@ import utime
 import json
 import network
 import socket
+import gc                          # ★ 가비지 컬렉터
 from machine import Pin, I2C
 
 # ============================================================
-# WiFi 설정
+# 설정
 # ============================================================
-WIFI_SSID        = "app"
-WIFI_PASSWORD    = "20242024"
-IDLE_INTERVAL    = 15   # 대기 중 수집 주기 (초)
-MEASURE_INTERVAL = 1    # 측정 중 수집 주기 (초)
+WIFI_SSID        = "여기에_와이파이_이름"
+WIFI_PASSWORD    = "여기에_와이파이_비번"
+IDLE_INTERVAL    = 15
+MEASURE_INTERVAL = 1
 
 # ============================================================
 # 문자열 헬퍼
 # ============================================================
-def pad_right(s, width):
-    s = str(s)
-    return s + " " * (width - len(s)) if len(s) < width else s
-
 def zero_pad(n, width):
     s = str(n)
     return "0" * (width - len(s)) + s if len(s) < width else s
@@ -85,11 +81,11 @@ class SCD30Driver:
                 self._b2f(b[12], b[13], b[15], b[16])
             )
         except Exception as e:
-            print("SCD30 읽기 오류:", e)
+            print("SCD30 오류:", e)
             return None, None, None
 
 # ============================================================
-# 통계 함수
+# 통계
 # ============================================================
 def calc_mean(v):
     return round(sum(v) / len(v), 2) if v else 0.0
@@ -127,7 +123,7 @@ def elapsed_str():
             zero_pad(t % 60, 2))
 
 # ============================================================
-# WiFi 연결
+# WiFi
 # ============================================================
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
@@ -141,437 +137,381 @@ def connect_wifi():
         time.sleep(1)
     if wlan.isconnected():
         ip = wlan.ifconfig()[0]
-        print("\nWiFi 연결 성공! IP:", ip)
+        print("\nIP:", ip)
         return ip
-    print("\nWiFi 연결 실패")
+    print("\nWiFi 실패")
     return None
 
 # ============================================================
-# HTML 페이지 생성
+# ★ 핵심: HTML을 청크로 나눠서 전송하는 함수
 # ============================================================
-def build_html(monitor):
+def send_chunk(conn, text):
+    """문자열을 512바이트씩 나눠서 전송 (메모리 절약)"""
+    data = text.encode("utf-8")
+    pos  = 0
+    while pos < len(data):
+        chunk = data[pos:pos + 512]
+        conn.send(chunk)
+        pos += 512
+        time.sleep_ms(5)           # ★ 전송 사이 짧은 대기
+
+# ============================================================
+# ★ HTML을 여러 조각으로 나눠서 전송 (메모리 부족 방지)
+# ============================================================
+def send_html(conn, monitor):
+    """HTML을 한 번에 만들지 않고 조각씩 전송"""
+
+    gc.collect()                   # ★ 전송 전 메모리 정리
+
     co2  = monitor.last_co2  or 0
     temp = monitor.last_temp or 0
     humi = monitor.last_humi or 0
     lvl, color = evaluate_co2(co2)
-    state_str  = monitor._state_str()
 
-    # 측정 중 여부
     is_measuring = monitor.state in (
         monitor.STATE_GAS_MEAS,
         monitor.STATE_HYDRO_MEAS
     )
     current_count = len(monitor.current_readings)
 
-    # 비교 수치
+    # 조건부 값 변수화
+    interval_info     = "1초 (측정중)" if is_measuring else "15초 (대기중)"
+    interval_bg       = "#c0392b"     if is_measuring else "#2c3e50"
+    start_gas_href    = ""            if is_measuring else "/start_gas"
+    start_hydro_href  = ""            if is_measuring else "/start_hydro"
+    stop_href         = "/stop"       if is_measuring else ""
+    start_gas_style   = "opacity:0.4;pointer-events:none" if is_measuring else ""
+    start_hydro_style = "opacity:0.4;pointer-events:none" if is_measuring else ""
+    stop_style        = ""            if is_measuring else "opacity:0.4;pointer-events:none"
+    state_str         = monitor._state_str()
+
     g_avg = monitor._get_overall_avg("gas")
     h_avg = monitor._get_overall_avg("hydro")
-    g_avg_str = str(g_avg) + " ppm" if g_avg is not None else "데이터 없음"
-    h_avg_str = str(h_avg) + " ppm" if h_avg is not None else "데이터 없음"
+    g_avg_str = str(g_avg) + " ppm" if g_avg is not None else "-"
+    h_avg_str = str(h_avg) + " ppm" if h_avg is not None else "-"
 
-    diff_str   = ""
+    diff_str   = "-"
     diff_color = "#ecf0f1"
     result_msg = ""
     if g_avg is not None and h_avg is not None:
         diff = round(g_avg - h_avg, 2)
-        diff_str = ("+" if diff >= 0 else "") + str(diff) + " ppm"
+        diff_str   = ("+" if diff >= 0 else "") + str(diff) + " ppm"
+        diff_color = "#e74c3c" if diff > 10 else ("#f39c12" if diff > 0 else "#2ecc71")
         if diff > 10:
-            diff_color = "#e74c3c"
-            result_msg = ("수소전기버스가 " + str(diff) +
-                          " ppm 더 낮습니다! 친환경적입니다.")
+            result_msg = "수소버스가 " + str(diff) + " ppm 낮습니다! 친환경적입니다."
         elif diff > 0:
-            diff_color = "#f39c12"
-            result_msg = ("수소전기버스가 약간 낮습니다 (" +
-                          str(diff) + " ppm)")
+            result_msg = "수소버스가 약간 낮습니다 (" + str(diff) + " ppm)"
         else:
-            diff_color = "#2ecc71"
             result_msg = "이번 측정에서는 비슷하거나 가스버스가 낮습니다."
 
-    # 수집 주기 안내
-    interval_info = ("1초 (측정 중)" if is_measuring
-                     else "15초 (대기 중)")
+    # 배너
+    if is_measuring:
+        if monitor.state == monitor.STATE_GAS_MEAS:
+            banner_bg   = "#c0392b"
+            banner_name = "가스버스"
+        else:
+            banner_bg   = "#1e8449"
+            banner_name = "수소전기버스"
+        banner = (
+            "<div style='background:" + banner_bg +
+            ";padding:12px;text-align:center;"
+            "font-weight:bold;color:white;font-size:14px'>"
+            + banner_name + " 측정중 | 수집: " +
+            str(current_count) + "회 | 1초마다 수집</div>"
+        )
+    else:
+        banner = ""
 
-    # ── 가스버스 세션 행 ────────────────────────────────
+    # ── HTTP 헤더 먼저 전송 ──────────────────────────────
+    conn.send(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+
+    # ── CSS (1번째 청크) ─────────────────────────────────
+    send_chunk(conn,
+        "<!DOCTYPE html><html lang='ko'><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>버스 공기질 | 당곡고</title>"
+        "<style>"
+        "*{margin:0;padding:0;box-sizing:border-box}"
+        "body{background:#1a1a2e;color:#eee;"
+        "font-family:sans-serif;font-size:14px}"
+        "h1{font-size:17px}"
+        ".hd{background:#16213e;padding:14px 18px;"
+        "border-bottom:3px solid #e74c3c}"
+        ".hd p{font-size:11px;color:#aaa;margin-top:3px}"
+        ".sb{background:#0f3460;padding:8px 18px;"
+        "display:flex;flex-wrap:wrap;gap:14px;align-items:center}"
+        ".si{font-size:12px;color:#ccc}"
+        ".sv{font-weight:bold;font-size:13px}"
+        ".bw{display:inline-block;padding:2px 8px;"
+        "border-radius:8px;font-size:11px;font-weight:bold}"
+        ".grid{display:grid;"
+        "grid-template-columns:repeat(4,1fr);"
+        "gap:10px;padding:14px 18px}"
+        ".card{background:#16213e;border-radius:10px;"
+        "padding:16px;text-align:center}"
+        ".cl{font-size:10px;color:#aaa;margin-bottom:5px}"
+        ".cv{font-size:26px;font-weight:bold;margin-bottom:2px}"
+        ".cu{font-size:10px;color:#777}"
+        ".sec{padding:0 18px 16px}"
+        ".st{font-size:13px;font-weight:bold;margin-bottom:8px;"
+        "padding-bottom:5px;border-bottom:1px solid #333}"
+        ".bg{display:flex;gap:8px;flex-wrap:wrap}"
+        ".btn{padding:10px 18px;border:none;border-radius:7px;"
+        "font-size:12px;font-weight:bold;cursor:pointer;"
+        "text-decoration:none;color:white;display:inline-block}"
+        ".bg1{background:#c0392b}"
+        ".bg2{background:#1e8449}"
+        ".bg3{background:#d35400}"
+        ".bg4{background:#6c3483}"
+        ".bg5{background:#2c3e50;color:#bbb;border:1px solid #555}"
+        ".cg{display:grid;grid-template-columns:1fr 1fr 1fr;"
+        "gap:10px;margin-bottom:12px}"
+        ".cc{background:#16213e;border-radius:10px;"
+        "padding:14px;text-align:center}"
+        ".ccl{font-size:10px;color:#aaa;margin-bottom:4px}"
+        ".ccv{font-size:20px;font-weight:bold}"
+        ".ccs{font-size:10px;color:#777;margin-top:2px}"
+        ".rb{background:#16213e;border-radius:8px;padding:12px;"
+        "text-align:center;font-size:12px;color:#f1c40f;"
+        "border:1px solid #333;margin-top:8px}"
+        ".tw{overflow-x:auto;border-radius:8px}"
+        "table{width:100%;border-collapse:collapse;font-size:11px}"
+        "th{background:#0f3460;color:#aaa;padding:8px 8px;"
+        "text-align:left;white-space:nowrap}"
+        "td{padding:7px 8px;border-bottom:1px solid #16213e;"
+        "white-space:nowrap}"
+        "tr:hover td{background:#16213e}"
+        ".tabs{display:flex;gap:3px;margin-bottom:0}"
+        ".tab{padding:7px 14px;background:#16213e;color:#888;"
+        "cursor:pointer;font-size:11px;font-weight:bold;"
+        "border-radius:6px 6px 0 0}"
+        ".tab.on{color:white}"
+        ".tc{display:none;border:1px solid #333;"
+        "border-radius:0 6px 6px 6px}"
+        ".tc.on{display:block}"
+        "@media(max-width:500px){"
+        ".grid{grid-template-columns:repeat(2,1fr)}"
+        ".cg{grid-template-columns:1fr}}"
+        "</style></head><body>"
+    )
+
+    # ── 헤더 + 배너 (2번째 청크) ────────────────────────
+    send_chunk(conn,
+        "<div class='hd'>"
+        "<h1>버스 공기질 비교 시스템</h1>"
+        "<p>당곡고등학교 환경탐구 | SCD30 | Pico W</p>"
+        "</div>"
+        + banner +
+        "<div class='sb'>"
+        "<div class='si'>상태: <span class='sv' style='color:#f1c40f'>"
+        + state_str + "</span></div>"
+        "<div class='si'>경과: <span class='sv'>" + elapsed_str() + "</span></div>"
+        "<div class='si'>주기: <span class='bw' style='background:"
+        + interval_bg + "'>" + interval_info + "</span></div>"
+        "<div class='si'>가스: <span class='bw' style='background:#c0392b'>"
+        + str(len(monitor.gas_sessions)) + "회</span></div>"
+        "<div class='si'>수소: <span class='bw' style='background:#1e8449'>"
+        + str(len(monitor.hydro_sessions)) + "회</span>"
+        + (" &nbsp; 수집: <span class='sv' style='color:#e74c3c'>"
+           + str(current_count) + "회</span>" if is_measuring else "") +
+        "</div>"
+        "</div>"
+    )
+
+    # ── 실시간 카드 (3번째 청크) ────────────────────────
+    send_chunk(conn,
+        "<div class='grid'>"
+        "<div class='card'><div class='cl'>CO2 농도</div>"
+        "<div class='cv' style='color:" + color + "'>" + str(co2) + "</div>"
+        "<div class='cu'>ppm</div></div>"
+
+        "<div class='card'><div class='cl'>온도</div>"
+        "<div class='cv' style='color:#3498db'>" + str(temp) + "</div>"
+        "<div class='cu'>°C</div></div>"
+
+        "<div class='card'><div class='cl'>습도</div>"
+        "<div class='cv' style='color:#2ecc71'>" + str(humi) + "</div>"
+        "<div class='cu'>%</div></div>"
+
+        "<div class='card'><div class='cl'>등급</div>"
+        "<div class='cv' style='color:" + color + ";font-size:17px'>"
+        + lvl + "</div>"
+        "<div class='cu'>현재 수준</div></div>"
+        "</div>"
+    )
+
+    # ── 제어 버튼 (4번째 청크) ──────────────────────────
+    send_chunk(conn,
+        "<div class='sec'><div class='st'>측정 제어</div>"
+        "<div class='bg'>"
+        "<a class='btn bg1' style='" + start_gas_style + "'"
+        " href='" + start_gas_href + "'>가스버스 시작</a>"
+        "<a class='btn bg2' style='" + start_hydro_style + "'"
+        " href='" + start_hydro_href + "'>수소버스 시작</a>"
+        "<a class='btn bg3' style='" + stop_style + "'"
+        " href='" + stop_href + "'>측정 종료</a>"
+        "<a class='btn bg4' href='/'>새로고침</a>"
+        "<a class='btn bg5' href='/reset'"
+        " onclick=\"return confirm('초기화?\')\">"
+        "초기화</a>"
+        "</div></div>"
+    )
+
+    # ── 비교 요약 (5번째 청크) ──────────────────────────
+    send_chunk(conn,
+        "<div class='sec'><div class='st'>비교 요약</div>"
+        "<div class='cg'>"
+
+        "<div class='cc' style='border-top:3px solid #c0392b'>"
+        "<div class='ccl'>가스버스 평균 CO2</div>"
+        "<div class='ccv' style='color:#e74c3c'>" + g_avg_str + "</div>"
+        "<div class='ccs'>" + str(len(monitor.gas_sessions)) + "개 세션</div>"
+        "</div>"
+
+        "<div class='cc' style='border-top:3px solid #1e8449'>"
+        "<div class='ccl'>수소버스 평균 CO2</div>"
+        "<div class='ccv' style='color:#2ecc71'>" + h_avg_str + "</div>"
+        "<div class='ccs'>" + str(len(monitor.hydro_sessions)) + "개 세션</div>"
+        "</div>"
+
+        "<div class='cc' style='border-top:3px solid " + diff_color + "'>"
+        "<div class='ccl'>차이 (가스-수소)</div>"
+        "<div class='ccv' style='color:" + diff_color + "'>" + diff_str + "</div>"
+        "<div class='ccs'>양수=가스버스 높음</div>"
+        "</div>"
+        "</div>"
+        + ("<div class='rb'>" + result_msg + "</div>" if result_msg else "") +
+        "</div>"
+    )
+
+    # ── 가스버스 세션 테이블 (6번째 청크) ───────────────
     gas_rows = ""
     for s in monitor.gas_sessions:
-        a   = s["stats"]["co2"]["avg"]
-        mx  = s["stats"]["co2"]["max"]
-        mn  = s["stats"]["co2"]["min"]
+        a      = s["stats"]["co2"]["avg"]
+        mx     = s["stats"]["co2"]["max"]
+        mn     = s["stats"]["co2"]["min"]
         lv, cl = evaluate_co2(a)
         gas_rows += (
-            "<tr>"
-            "<td>#" + str(s["session_no"]) + "</td>"
+            "<tr><td>#" + str(s["session_no"]) + "</td>"
             "<td>" + s["start_time"] + "</td>"
             "<td>" + s["end_time"]   + "</td>"
             "<td>" + str(s["count"]) + "회</td>"
-            "<td style='color:" + cl + ";font-weight:bold'>"
-            + str(a) + "</td>"
+            "<td style='color:" + cl + ";font-weight:bold'>" + str(a) + "</td>"
             "<td>" + str(mx) + "</td>"
             "<td>" + str(mn) + "</td>"
-            "<td style='color:" + cl + "'>" + lv + "</td>"
-            "</tr>"
+            "<td style='color:" + cl + "'>" + lv + "</td></tr>"
         )
     if not gas_rows:
-        gas_rows = ("<tr><td colspan='8' "
-                    "style='text-align:center;color:#7f8c8d'>"
-                    "측정 데이터 없음</td></tr>")
+        gas_rows = "<tr><td colspan='8' style='text-align:center;color:#777'>데이터 없음</td></tr>"
 
-    # ── 수소버스 세션 행 ────────────────────────────────
+    # ── 수소버스 세션 테이블 (7번째 청크) ───────────────
     hydro_rows = ""
     for s in monitor.hydro_sessions:
-        a   = s["stats"]["co2"]["avg"]
-        mx  = s["stats"]["co2"]["max"]
-        mn  = s["stats"]["co2"]["min"]
+        a      = s["stats"]["co2"]["avg"]
+        mx     = s["stats"]["co2"]["max"]
+        mn     = s["stats"]["co2"]["min"]
         lv, cl = evaluate_co2(a)
         hydro_rows += (
-            "<tr>"
-            "<td>#" + str(s["session_no"]) + "</td>"
+            "<tr><td>#" + str(s["session_no"]) + "</td>"
             "<td>" + s["start_time"] + "</td>"
             "<td>" + s["end_time"]   + "</td>"
             "<td>" + str(s["count"]) + "회</td>"
-            "<td style='color:" + cl + ";font-weight:bold'>"
-            + str(a) + "</td>"
+            "<td style='color:" + cl + ";font-weight:bold'>" + str(a) + "</td>"
             "<td>" + str(mx) + "</td>"
             "<td>" + str(mn) + "</td>"
-            "<td style='color:" + cl + "'>" + lv + "</td>"
-            "</tr>"
+            "<td style='color:" + cl + "'>" + lv + "</td></tr>"
         )
     if not hydro_rows:
-        hydro_rows = ("<tr><td colspan='8' "
-                      "style='text-align:center;color:#7f8c8d'>"
-                      "측정 데이터 없음</td></tr>")
+        hydro_rows = "<tr><td colspan='8' style='text-align:center;color:#777'>데이터 없음</td></tr>"
 
-    # ── 최근 30개 측정 기록 ─────────────────────────────
+    # ── 최근 기록 테이블 (8번째 청크) ───────────────────
     recent_rows = ""
-    recent = monitor.all_recent[-30:]
-    recent_rev = recent[::-1]
-    for r in recent_rev:
+    recent = monitor.all_recent[-20:]   # ★ 20개로 줄여서 메모리 절약
+    for r in recent[::-1]:
         lv, cl = evaluate_co2(r["co2"])
         recent_rows += (
-            "<tr>"
-            "<td>" + r["time"]     + "</td>"
-            "<td>" + r["bus_type"] + "</td>"
+            "<tr><td>" + r["time"]     + "</td>"
+            "<td>" + r["bus_type"]     + "</td>"
             "<td style='color:" + cl + ";font-weight:bold'>"
-            + str(r["co2"]) + "</td>"
-            "<td>" + str(r["temp"]) + "</td>"
-            "<td>" + str(r["humi"]) + "</td>"
-            "<td style='color:" + cl + "'>" + lv + "</td>"
-            "</tr>"
+            + str(r["co2"])  + "</td>"
+            "<td>" + str(r["temp"])    + "</td>"
+            "<td>" + str(r["humi"])    + "</td>"
+            "<td style='color:" + cl + "'>" + lv + "</td></tr>"
         )
     if not recent_rows:
-        recent_rows = ("<tr><td colspan='6' "
-                       "style='text-align:center;color:#7f8c8d'>"
-                       "측정 기록 없음</td></tr>")
+        recent_rows = "<tr><td colspan='6' style='text-align:center;color:#777'>기록 없음</td></tr>"
 
-    # ── 측정 중 진행 상황 배너 ──────────────────────────
-    measuring_banner = ""
-    if is_measuring:
-        bus_color = ("#e74c3c" if monitor.state == monitor.STATE_GAS_MEAS
-                     else "#27ae60")
-        bus_name  = ("가스버스" if monitor.state == monitor.STATE_GAS_MEAS
-                     else "수소전기버스")
-        measuring_banner = (
-            "<div style='background:" + bus_color + ";"
-            "padding:14px 24px;text-align:center;"
-            "font-size:15px;font-weight:bold;color:white;"
-            "animation:pulse 1s infinite'>"
-            "🔴 " + bus_name + " 측정 중 | "
-            "수집 횟수: " + str(current_count) + "회 | "
-            "1초마다 수집 중 | "
-            "종료하려면 [측정 종료] 버튼을 누르세요"
-            "</div>"
-        )
+    # ── 탭 + 테이블 (9번째 청크) ────────────────────────
+    send_chunk(conn,
+        "<div class='sec'><div class='st'>세션별 결과</div>"
+        "<div class='tabs'>"
+        "<div class='tab on' id='tg' style='background:#c0392b'"
+        " onclick=\"st('g')\">가스버스</div>"
+        "<div class='tab' id='th'"
+        " onclick=\"st('h')\">수소버스</div>"
+        "<div class='tab' id='tr'"
+        " onclick=\"st('r')\">최근측정</div>"
+        "</div>"
+    )
 
-    html = """<!DOCTYPE html>
-<html lang='ko'>
-<head>
-<meta charset='UTF-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1.0'>
-<title>버스 공기질 비교 | 당곡고</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{background:#1e272e;color:#ecf0f1;
-       font-family:'Malgun Gothic',sans-serif}
+    send_chunk(conn,
+        "<div id='tc-g' class='tc on'><div class='tw'>"
+        "<table><thead><tr>"
+        "<th>#</th><th>시작</th><th>종료</th><th>횟수</th>"
+        "<th>평균CO2</th><th>최대</th><th>최소</th><th>등급</th>"
+        "</tr></thead><tbody>" + gas_rows +
+        "</tbody></table></div></div>"
+    )
 
-  .header{background:#2c3e50;padding:16px 24px;
-          border-bottom:3px solid #e74c3c}
-  .header h1{font-size:20px;color:#ecf0f1}
-  .header p{font-size:11px;color:#95a5a6;margin-top:3px}
+    send_chunk(conn,
+        "<div id='tc-h' class='tc'><div class='tw'>"
+        "<table><thead><tr>"
+        "<th>#</th><th>시작</th><th>종료</th><th>횟수</th>"
+        "<th>평균CO2</th><th>최대</th><th>최소</th><th>등급</th>"
+        "</tr></thead><tbody>" + hydro_rows +
+        "</tbody></table></div></div>"
+    )
 
-  .status-bar{background:#34495e;padding:8px 24px;
-              display:flex;align-items:center;
-              gap:20px;flex-wrap:wrap}
-  .st-item{font-size:12px;color:#bdc3c7}
-  .st-val{font-weight:bold;font-size:13px}
-  .badge{display:inline-block;padding:2px 10px;
-         border-radius:10px;font-size:12px;font-weight:bold}
+    send_chunk(conn,
+        "<div id='tc-r' class='tc'><div class='tw'>"
+        "<table><thead><tr>"
+        "<th>시각</th><th>버스</th>"
+        "<th>CO2</th><th>온도</th><th>습도</th><th>등급</th>"
+        "</tr></thead><tbody>" + recent_rows +
+        "</tbody></table></div></div>"
+        "</div>"
+    )
 
-  /* 수집 주기 표시 */
-  .interval-badge{display:inline-block;padding:4px 14px;
-                  border-radius:20px;font-size:12px;
-                  font-weight:bold;margin-left:8px}
+    # ── JavaScript (10번째 청크) ─────────────────────────
+    auto_js = "setTimeout(function(){location.reload()},3000);" if is_measuring else ""
+    send_chunk(conn,
+        "<script>"
+        "function st(n){"
+        "['g','h','r'].forEach(function(x){"
+        "document.getElementById('tc-'+x).classList.remove('on');"
+        "var t=document.getElementById('t'+x);"
+        "t.classList.remove('on');"
+        "t.style.background='';"
+        "});"
+        "document.getElementById('tc-'+n).classList.add('on');"
+        "var el=document.getElementById('t'+n);"
+        "el.classList.add('on');"
+        "var c={'g':'#c0392b','h':'#1e8449','r':'#2980b9'};"
+        "el.style.background=c[n];}"
+        + auto_js +
+        "</script></body></html>"
+    )
 
-  /* 실시간 카드 */
-  .live-grid{display:grid;grid-template-columns:repeat(4,1fr);
-             gap:12px;padding:16px 24px}
-  .card{background:#2c3e50;border-radius:12px;
-        padding:18px;text-align:center;
-        border:1px solid #34495e}
-  .card-label{font-size:11px;color:#95a5a6;
-              margin-bottom:6px;text-transform:uppercase}
-  .card-value{font-size:30px;font-weight:bold;margin-bottom:3px}
-  .card-unit{font-size:11px;color:#7f8c8d}
-
-  /* 제어 버튼 */
-  .section{padding:0 24px 20px}
-  .section-title{font-size:14px;font-weight:bold;
-                 color:#ecf0f1;margin-bottom:10px;
-                 padding-bottom:6px;
-                 border-bottom:2px solid #34495e}
-  .btn-group{display:flex;gap:10px;flex-wrap:wrap}
-  .btn{padding:11px 22px;border:none;border-radius:8px;
-       font-size:13px;font-weight:bold;cursor:pointer;
-       text-decoration:none;display:inline-block;
-       transition:opacity .2s;color:white}
-  .btn:hover{opacity:.82}
-  .btn-gas{background:#e74c3c}
-  .btn-hydro{background:#27ae60}
-  .btn-stop{background:#e67e22}
-  .btn-compare{background:#8e44ad}
-  .btn-reset{background:#2c3e50;color:#bdc3c7;
-             border:1px solid #555}
-  .btn-disabled{background:#555;color:#888;
-                pointer-events:none;cursor:not-allowed}
-
-  /* 비교 카드 */
-  .cmp-grid{display:grid;grid-template-columns:1fr 1fr 1fr;
-            gap:12px;margin-bottom:14px}
-  .cmp-card{background:#2c3e50;border-radius:12px;
-            padding:16px;text-align:center}
-  .cmp-label{font-size:11px;color:#95a5a6;margin-bottom:5px}
-  .cmp-value{font-size:22px;font-weight:bold}
-  .cmp-sub{font-size:11px;color:#7f8c8d;margin-top:3px}
-  .result-box{background:#2c3e50;border-radius:10px;
-              padding:14px;text-align:center;
-              font-size:13px;color:#f1c40f;
-              border:1px solid #34495e}
-
-  /* 테이블 */
-  .tbl-wrap{overflow-x:auto;border-radius:10px}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th{background:#34495e;color:#bdc3c7;padding:9px 10px;
-     text-align:left;font-size:11px;white-space:nowrap}
-  td{padding:8px 10px;border-bottom:1px solid #2c3e50;
-     color:#ecf0f1;white-space:nowrap}
-  tr:last-child td{border-bottom:none}
-  tr:hover td{background:#2c3e50}
-
-  /* 탭 */
-  .tabs{display:flex;gap:4px;margin-bottom:0}
-  .tab{padding:8px 18px;background:#2c3e50;color:#95a5a6;
-       cursor:pointer;font-size:12px;font-weight:bold;
-       border-radius:8px 8px 0 0;
-       border:1px solid #34495e;border-bottom:none}
-  .tab.act-gas{background:#e74c3c;color:white;
-                border-color:#e74c3c}
-  .tab.act-hydro{background:#27ae60;color:white;
-                  border-color:#27ae60}
-  .tab.act-recent{background:#3498db;color:white;
-                   border-color:#3498db}
-  .tab-content{display:none;
-               border:1px solid #34495e;border-radius:0 8px 8px 8px}
-  .tab-content.active{display:block}
-
-  @keyframes pulse{
-    0%{opacity:1} 50%{opacity:.7} 100%{opacity:1}
-  }
-  @media(max-width:600px){
-    .live-grid{grid-template-columns:repeat(2,1fr)}
-    .cmp-grid{grid-template-columns:1fr}
-  }
-</style>
-</head>
-<body>
-
-<!-- 헤더 -->
-<div class='header'>
-  <h1>🌿 버스 공기질 비교 시스템</h1>
-  <p>당곡고등학교 환경 탐구 프로젝트 &nbsp;|&nbsp;
-     SCD30 센서 &nbsp;|&nbsp; Raspberry Pi Pico W</p>
-</div>
-
-<!-- 측정 중 배너 -->
-""" + measuring_banner + """
-
-<!-- 상태 바 -->
-<div class='status-bar'>
-  <div class='st-item'>상태:&nbsp;
-    <span class='st-val' style='color:#f1c40f'>"""+ state_str +"""</span>
-  </div>
-  <div class='st-item'>경과:&nbsp;
-    <span class='st-val'>""" + elapsed_str() + """</span>
-  </div>
-  <div class='st-item'>수집 주기:&nbsp;
-    <span class='interval-badge' style='background:""" +
-    ("#e74c3c" if is_measuring else "#2c3e50") +
-    ";border:1px solid #555'>""" + interval_info + """</span>
-  </div>
-  <div class='st-item'>가스버스 세션:&nbsp;
-    <span class='badge' style='background:#e74c3c'>"""
-    + str(len(monitor.gas_sessions)) + """회</span>
-  </div>
-  <div class='st-item'>수소버스 세션:&nbsp;
-    <span class='badge' style='background:#27ae60'>"""
-    + str(len(monitor.hydro_sessions)) + """회</span>
-  </div>
-  """ + ("<div class='st-item'>현재 수집:&nbsp;<span class='st-val' style='color:#e74c3c'>"
-         + str(current_count) + "회</span></div>" if is_measuring else "") + """
-</div>
-
-<!-- 실시간 카드 -->
-<div class='live-grid'>
-  <div class='card'>
-    <div class='card-label'>CO₂ 농도</div>
-    <div class='card-value' style='color:""" + color + """'>""" + str(co2) + """</div>
-    <div class='card-unit'>ppm</div>
-  </div>
-  <div class='card'>
-    <div class='card-label'>온도</div>
-    <div class='card-value' style='color:#3498db'>""" + str(temp) + """</div>
-    <div class='card-unit'>°C</div>
-  </div>
-  <div class='card'>
-    <div class='card-label'>습도</div>
-    <div class='card-value' style='color:#2ecc71'>""" + str(humi) + """</div>
-    <div class='card-unit'>%</div>
-  </div>
-  <div class='card'>
-    <div class='card-label'>공기질 등급</div>
-    <div class='card-value' style='color:""" + color + """;font-size:20px'>""" + lvl + """</div>
-    <div class='card-unit'>현재 수준</div>
-  </div>
-</div>
-
-<!-- 제어 버튼 -->
-<div class='section'>
-  <div class='section-title'>🎮 측정 제어</div>
-  <div class='btn-group'>
-    <a class='btn """ + ("btn-disabled" if is_measuring else "btn-gas") + """'
-       href='""" + ("" if is_measuring else "/start_gas") + """'>
-      🚌 가스버스 측정 시작
-    </a>
-    <a class='btn """ + ("btn-disabled" if is_measuring else "btn-hydro") + """'
-       href='""" + ("" if is_measuring else "/start_hydro") + """'>
-      🚍 수소버스 측정 시작
-    </a>
-    <a class='btn """ + ("btn-stop" if is_measuring else "btn-disabled") + """'
-       href='""" + ("/stop" if is_measuring else "") + """'>
-      ⏹ 측정 종료
-    </a>
-    <a class='btn btn-compare' href='/'>📊 새로고침</a>
-    <a class='btn btn-reset'   href='/reset'
-       onclick="return confirm('전체 데이터를 초기화할까요?')">
-      🗑 전체 초기화
-    </a>
-  </div>
-</div>
-
-<!-- 비교 요약 -->
-<div class='section'>
-  <div class='section-title'>📊 비교 요약</div>
-  <div class='cmp-grid'>
-    <div class='cmp-card' style='border-top:3px solid #e74c3c'>
-      <div class='cmp-label'>🚌 가스버스 평균 CO₂</div>
-      <div class='cmp-value' style='color:#e74c3c'>""" + g_avg_str + """</div>
-      <div class='cmp-sub'>""" + str(len(monitor.gas_sessions)) + """개 세션</div>
-    </div>
-    <div class='cmp-card' style='border-top:3px solid #27ae60'>
-      <div class='cmp-label'>🚍 수소버스 평균 CO₂</div>
-      <div class='cmp-value' style='color:#27ae60'>""" + h_avg_str + """</div>
-      <div class='cmp-sub'>""" + str(len(monitor.hydro_sessions)) + """개 세션</div>
-    </div>
-    <div class='cmp-card' style='border-top:3px solid """ + diff_color + """'>
-      <div class='cmp-label'>차이 (가스 - 수소)</div>
-      <div class='cmp-value' style='color:""" + diff_color + """'>"""
-    + (diff_str if diff_str else "—") + """</div>
-      <div class='cmp-sub'>양수 = 가스버스가 높음</div>
-    </div>
-  </div>
-  """ + ("<div class='result-box'>" + result_msg + "</div>"
-         if result_msg else "") + """
-</div>
-
-<!-- 세션 테이블 -->
-<div class='section'>
-  <div class='section-title'>📋 세션별 측정 결과</div>
-  <div class='tabs'>
-    <div class='tab act-gas'    id='t-gas'
-         onclick="showTab('gas')">🚌 가스버스</div>
-    <div class='tab'            id='t-hydro'
-         onclick="showTab('hydro')">🚍 수소버스</div>
-    <div class='tab'            id='t-recent'
-         onclick="showTab('recent')">📡 최근 측정</div>
-  </div>
-
-  <div id='tab-gas' class='tab-content active'>
-    <div class='tbl-wrap'>
-    <table>
-      <thead><tr>
-        <th>#</th><th>시작</th><th>종료</th><th>횟수</th>
-        <th>평균 CO₂</th><th>최대</th><th>최소</th><th>등급</th>
-      </tr></thead>
-      <tbody>""" + gas_rows + """</tbody>
-    </table>
-    </div>
-  </div>
-
-  <div id='tab-hydro' class='tab-content'>
-    <div class='tbl-wrap'>
-    <table>
-      <thead><tr>
-        <th>#</th><th>시작</th><th>종료</th><th>횟수</th>
-        <th>평균 CO₂</th><th>최대</th><th>최소</th><th>등급</th>
-      </tr></thead>
-      <tbody>""" + hydro_rows + """</tbody>
-    </table>
-    </div>
-  </div>
-
-  <div id='tab-recent' class='tab-content'>
-    <div class='tbl-wrap'>
-    <table>
-      <thead><tr>
-        <th>시각</th><th>버스종류</th>
-        <th>CO₂(ppm)</th><th>온도(°C)</th>
-        <th>습도(%)</th><th>등급</th>
-      </tr></thead>
-      <tbody>""" + recent_rows + """</tbody>
-    </table>
-    </div>
-  </div>
-</div>
-
-<script>
-function showTab(name){
-  ["gas","hydro","recent"].forEach(function(n){
-    document.getElementById("tab-"+n).classList.remove("active");
-    var t = document.getElementById("t-"+n);
-    t.classList.remove("act-gas","act-hydro","act-recent");
-  });
-  document.getElementById("tab-"+name).classList.add("active");
-  var cls = {"gas":"act-gas","hydro":"act-hydro","recent":"act-recent"};
-  document.getElementById("t-"+name).classList.add(cls[name]);
-}
-
-// 측정 중일 때 3초마다 자동 새로고침
-""" + ("setTimeout(function(){location.reload()},3000);" if is_measuring else "") + """
-</script>
-</body></html>"""
-    return html
+    gc.collect()                   # ★ 전송 후 메모리 정리
 
 
 # ============================================================
-# 메인 시스템 클래스
+# 메인 시스템
 # ============================================================
 class BusAirMonitor:
 
@@ -581,55 +521,44 @@ class BusAirMonitor:
     STATE_SHOW_RESULT = 3
 
     def __init__(self):
-        print("=" * 50)
-        print("  버스 공기질 비교 시스템 (웹앱 버전)")
+        print("=" * 45)
+        print("  버스 공기질 비교 시스템")
         print("  당곡고등학교 환경 탐구 프로젝트")
-        print("=" * 50)
+        print("=" * 45)
 
-        # I2C
         self.i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=50000)
-        print("I2C 장치:", [hex(a) for a in self.i2c.scan()])
+        print("I2C:", [hex(a) for a in self.i2c.scan()])
 
-        # SCD30
         try:
             self.sensor = SCD30Driver(self.i2c)
-            print("SCD30 초기화 완료")
+            print("SCD30 OK")
         except Exception as e:
             print("SCD30 오류:", e)
             self.sensor = None
 
-        # 버튼 / LED
         self.btn_start = Pin(14, Pin.IN, Pin.PULL_UP)
         self.btn_stop  = Pin(15, Pin.IN, Pin.PULL_UP)
         self.led       = Pin(25, Pin.OUT)
 
-        # 데이터
         self.gas_sessions   = []
         self.hydro_sessions = []
-        self.all_recent     = []
+        self.all_recent     = []       # ★ 최대 100개로 제한
 
         self.current_readings = []
         self.current_type     = None
 
-        # 상태
-        self.state         = self.STATE_IDLE
-        self.last_co2      = None
-        self.last_temp     = None
-        self.last_humi     = None
-        self.last_btn_time = 0
-        self.DEBOUNCE_MS   = 300
-        self.led_tick      = 0
-
-        # ★ 핵심: 수집 타이머 분리
+        self.state           = self.STATE_IDLE
+        self.last_co2        = None
+        self.last_temp       = None
+        self.last_humi       = None
+        self.last_btn_time   = 0
+        self.DEBOUNCE_MS     = 300
+        self.led_tick        = 0
         self.last_measure_ms = utime.ticks_ms()
 
-        # 웹 서버
         self.server_sock = None
         self.ip          = None
 
-    # ──────────────────────────────────────────────────────
-    # 상태 문자열
-    # ──────────────────────────────────────────────────────
     def _state_str(self):
         if self.state == self.STATE_IDLE:        return "대기중"
         if self.state == self.STATE_GAS_MEAS:    return "가스버스 측정중"
@@ -637,22 +566,11 @@ class BusAirMonitor:
         if self.state == self.STATE_SHOW_RESULT: return "결과표시중"
         return "알수없음"
 
-    # ──────────────────────────────────────────────────────
-    # ★ 현재 수집 주기 반환
-    # ──────────────────────────────────────────────────────
     def _current_interval_ms(self):
-        """
-        측정 중  → 1000ms (1초)
-        대기 중  → 15000ms (15초)
-        """
-        if self.state in (self.STATE_GAS_MEAS,
-                          self.STATE_HYDRO_MEAS):
-            return MEASURE_INTERVAL * 1000   # 1,000 ms
-        return IDLE_INTERVAL * 1000          # 15,000 ms
+        if self.state in (self.STATE_GAS_MEAS, self.STATE_HYDRO_MEAS):
+            return MEASURE_INTERVAL * 1000
+        return IDLE_INTERVAL * 1000
 
-    # ──────────────────────────────────────────────────────
-    # 센서 읽기
-    # ──────────────────────────────────────────────────────
     def read_sensor(self):
         if self.sensor is None:
             import urandom
@@ -662,7 +580,7 @@ class BusAirMonitor:
                 float(45  + (urandom.getrandbits(5) % 30))
             )
         try:
-            for _ in range(10):
+            for _ in range(5):              # ★ 반복 횟수 줄임
                 if self.sensor.data_available():
                     co2, temp, humi = self.sensor.read_measurement()
                     if co2 and 300 <= co2 <= 5000:
@@ -672,27 +590,22 @@ class BusAirMonitor:
             print("센서 오류:", e)
         return None, None, None
 
-    # ──────────────────────────────────────────────────────
-    # 측정 제어
-    # ──────────────────────────────────────────────────────
     def start_measurement(self, bus_type):
         self.current_readings = []
         self.current_type     = bus_type
         self.state = (self.STATE_GAS_MEAS
                       if bus_type == "gas"
                       else self.STATE_HYDRO_MEAS)
-
-        # ★ 즉시 첫 번째 수집을 위해 타이머 초기화
-        self.last_measure_ms = utime.ticks_ms() - self._current_interval_ms()
-
+        self.last_measure_ms = (utime.ticks_ms()
+                                - self._current_interval_ms())
         label = "가스버스" if bus_type == "gas" else "수소전기버스"
-        print("\n[" + label + "] 측정 시작! (1초마다 수집)")
+        print("[" + label + "] 측정 시작!")
         self.led.on()
 
     def stop_measurement(self):
         self.led.off()
         if not self.current_readings:
-            print("경고: 데이터 없음")
+            print("데이터 없음")
             self.state = self.STATE_IDLE
             return
 
@@ -712,37 +625,31 @@ class BusAirMonitor:
             "end_time"   : self.current_readings[-1]["time"],
             "readings"   : self.current_readings[:],
             "stats": {
-                "co2" : {
-                    "avg"  : calc_mean(co2_v),
-                    "max"  : calc_max(co2_v),
-                    "min"  : calc_min(co2_v),
-                    "stdev": calc_stdev(co2_v)
-                },
-                "temp": {
-                    "avg" : calc_mean(temp_v),
-                    "max" : calc_max(temp_v),
-                    "min" : calc_min(temp_v)
-                },
-                "humi": {
-                    "avg" : calc_mean(humi_v),
-                    "max" : calc_max(humi_v),
-                    "min" : calc_min(humi_v)
-                }
+                "co2" : {"avg"  : calc_mean(co2_v),
+                         "max"  : calc_max(co2_v),
+                         "min"  : calc_min(co2_v),
+                         "stdev": calc_stdev(co2_v)},
+                "temp": {"avg"  : calc_mean(temp_v),
+                         "max"  : calc_max(temp_v),
+                         "min"  : calc_min(temp_v)},
+                "humi": {"avg"  : calc_mean(humi_v),
+                         "max"  : calc_max(humi_v),
+                         "min"  : calc_min(humi_v)}
             }
         }
         sessions.append(session)
 
-        btype = "가스버스" if self.current_type == "gas" else "수소전기버스"
-        avg   = session["stats"]["co2"]["avg"]
+        avg    = session["stats"]["co2"]["avg"]
         lvl, _ = evaluate_co2(avg)
-        print("\n[" + btype + "] 세션#" + str(session["session_no"]) +
-              " 종료 | " + str(session["count"]) + "회 수집 | "
-              "평균CO2:" + str(avg) + "ppm | " + lvl)
+        btype  = "가스버스" if self.current_type == "gas" else "수소버스"
+        print("[" + btype + "] #" + str(session["session_no"]) +
+              " 종료 | " + str(session["count"]) + "회 | " +
+              str(avg) + "ppm | " + lvl)
 
-        # ★ 종료 후 대기 모드로 → 타이머 리셋
         self.state        = self.STATE_SHOW_RESULT
         self.current_type = None
         self.last_measure_ms = utime.ticks_ms()
+        gc.collect()               # ★ 종료 후 메모리 정리
 
     def reset_all(self):
         self.gas_sessions     = []
@@ -752,11 +659,9 @@ class BusAirMonitor:
         self.current_type     = None
         self.state            = self.STATE_IDLE
         self.last_measure_ms  = utime.ticks_ms()
-        print("전체 초기화 완료")
+        gc.collect()               # ★ 초기화 후 메모리 정리
+        print("초기화 완료")
 
-    # ──────────────────────────────────────────────────────
-    # 전체 평균
-    # ──────────────────────────────────────────────────────
     def _get_overall_avg(self, bus_type):
         s = (self.gas_sessions if bus_type == "gas"
              else self.hydro_sessions)
@@ -765,9 +670,6 @@ class BusAirMonitor:
         vals = [r["co2"] for ss in s for r in ss["readings"]]
         return calc_mean(vals) if vals else None
 
-    # ──────────────────────────────────────────────────────
-    # 디바운스
-    # ──────────────────────────────────────────────────────
     def _debounce_ok(self):
         now = utime.ticks_ms()
         if utime.ticks_diff(now, self.last_btn_time) > self.DEBOUNCE_MS:
@@ -775,9 +677,6 @@ class BusAirMonitor:
             return True
         return False
 
-    # ──────────────────────────────────────────────────────
-    # 물리 버튼 체크
-    # ──────────────────────────────────────────────────────
     def check_buttons(self):
         btn_a = self.btn_start.value() == 0
         btn_b = self.btn_stop.value()  == 0
@@ -795,21 +694,14 @@ class BusAirMonitor:
                 self.state = self.STATE_IDLE
             time.sleep_ms(50)
 
-    # ──────────────────────────────────────────────────────
-    # LED
-    # ──────────────────────────────────────────────────────
     def _blink_led(self):
-        if self.state in (self.STATE_GAS_MEAS,
-                          self.STATE_HYDRO_MEAS):
+        if self.state in (self.STATE_GAS_MEAS, self.STATE_HYDRO_MEAS):
             self.led_tick += 1
             if self.led_tick % 2 == 0:
                 self.led.toggle()
         else:
             self.led.off()
 
-    # ──────────────────────────────────────────────────────
-    # 웹 서버 설정
-    # ──────────────────────────────────────────────────────
     def setup_server(self):
         self.server_sock = socket.socket()
         self.server_sock.setsockopt(
@@ -817,59 +709,68 @@ class BusAirMonitor:
         self.server_sock.bind(("0.0.0.0", 80))
         self.server_sock.listen(1)
         self.server_sock.setblocking(False)
-        print("웹 서버 시작: http://" + str(self.ip))
+        print("서버: http://" + str(self.ip))
 
-    # ──────────────────────────────────────────────────────
-    # HTTP 처리
-    # ──────────────────────────────────────────────────────
     def handle_request(self):
         try:
             conn, addr = self.server_sock.accept()
-            conn.settimeout(2.0)
-            try:
-                req = conn.recv(512).decode("utf-8")
-            except:
-                conn.close()
-                return
+        except OSError:
+            return                 # 요청 없음
 
-            path = "/"
-            if req:
-                line  = req.split("\r\n")[0]
-                parts = line.split(" ")
-                if len(parts) >= 2:
-                    path = parts[1]
+        conn.settimeout(3.0)
+        try:
+            req = conn.recv(256).decode("utf-8")  # ★ 256으로 축소
+        except:
+            conn.close()
+            return
 
-            print("요청:", path)
+        path = "/"
+        try:
+            line  = req.split("\r\n")[0]
+            parts = line.split(" ")
+            if len(parts) >= 2:
+                path = parts[1]
+        except:
+            pass
 
+        print("요청:", path)
+        gc.collect()               # ★ 요청 처리 전 메모리 정리
+
+        try:
             if path == "/start_gas":
                 self.start_measurement("gas")
-                self._redirect(conn, "/")
+                conn.send(b"HTTP/1.1 302 Found\r\nLocation: /\r\n"
+                          b"Connection: close\r\n\r\n")
+                conn.close()
             elif path == "/start_hydro":
                 self.start_measurement("hydro")
-                self._redirect(conn, "/")
+                conn.send(b"HTTP/1.1 302 Found\r\nLocation: /\r\n"
+                          b"Connection: close\r\n\r\n")
+                conn.close()
             elif path == "/stop":
                 self.stop_measurement()
-                self._redirect(conn, "/")
+                conn.send(b"HTTP/1.1 302 Found\r\nLocation: /\r\n"
+                          b"Connection: close\r\n\r\n")
+                conn.close()
             elif path == "/reset":
                 self.reset_all()
-                self._redirect(conn, "/")
+                conn.send(b"HTTP/1.1 302 Found\r\nLocation: /\r\n"
+                          b"Connection: close\r\n\r\n")
+                conn.close()
             elif path == "/api":
+                # ★ JSON API (가벼운 데이터만)
                 lvl, clr = evaluate_co2(self.last_co2)
                 data = {
-                    "co2"            : self.last_co2,
-                    "temp"           : self.last_temp,
-                    "humi"           : self.last_humi,
-                    "level"          : lvl,
-                    "color"          : clr,
-                    "state"          : self._state_str(),
-                    "is_measuring"   : self.state in (
-                                           self.STATE_GAS_MEAS,
-                                           self.STATE_HYDRO_MEAS),
-                    "current_count"  : len(self.current_readings),
-                    "gas_sessions"   : len(self.gas_sessions),
-                    "hydro_sessions" : len(self.hydro_sessions),
-                    "g_avg"          : self._get_overall_avg("gas"),
-                    "h_avg"          : self._get_overall_avg("hydro"),
+                    "co2"    : self.last_co2,
+                    "temp"   : self.last_temp,
+                    "humi"   : self.last_humi,
+                    "level"  : lvl,
+                    "state"  : self._state_str(),
+                    "count"  : len(self.current_readings),
+                    "g_sess" : len(self.gas_sessions),
+                    "h_sess" : len(self.hydro_sessions),
+                    "g_avg"  : self._get_overall_avg("gas"),
+                    "h_avg"  : self._get_overall_avg("hydro"),
                 }
                 body = json.dumps(data)
                 conn.send(("HTTP/1.1 200 OK\r\n"
@@ -878,61 +779,47 @@ class BusAirMonitor:
                            + body).encode())
                 conn.close()
             else:
-                html = build_html(self)
-                conn.send(("HTTP/1.1 200 OK\r\n"
-                           "Content-Type: text/html; charset=utf-8\r\n"
-                           "Connection: close\r\n\r\n"
-                           + html).encode())
+                # ★ HTML을 청크로 나눠 전송
+                send_html(conn, self)
                 conn.close()
 
-        except OSError:
-            pass
         except Exception as e:
-            print("요청 처리 오류:", e)
+            print("응답 오류:", e)
+            try:
+                conn.close()
+            except:
+                pass
 
-    def _redirect(self, conn, url):
-        conn.send(("HTTP/1.1 302 Found\r\n"
-                   "Location: " + url + "\r\n"
-                   "Connection: close\r\n\r\n").encode())
-        conn.close()
+        gc.collect()               # ★ 요청 완료 후 메모리 정리
 
-    # ──────────────────────────────────────────────────────
-    # ★ 메인 루프 (핵심: 수집 주기 동적 변경)
-    # ──────────────────────────────────────────────────────
     def run(self):
         self.ip = connect_wifi()
-        if not self.ip:
-            print("WiFi 실패. 시리얼만 사용")
-        else:
+        if self.ip:
             self.setup_server()
+        else:
+            print("오프라인 모드")
 
-        print("센서 워밍업 (5초)...")
+        print("워밍업 (5초)...")
         for i in range(5, 0, -1):
-            print("  " + str(i) + "초...")
+            print(" " + str(i) + "초...")
             time.sleep(1)
         print("준비 완료!")
         if self.ip:
             print("접속: http://" + self.ip)
         print()
-        print("대기중: 15초마다 수집")
-        print("측정중: 1초마다 수집")
-        print()
 
         while True:
-
-            # ── 물리 버튼 ──────────────────────────────
+            # 버튼
             self.check_buttons()
 
-            # ── 웹 요청 ────────────────────────────────
+            # 웹 요청
             if self.server_sock:
                 self.handle_request()
 
-            # ── ★ 수집 주기 체크 (동적 변경 핵심) ──────
+            # 센서 수집 (주기 체크)
             now      = utime.ticks_ms()
             interval = self._current_interval_ms()
-            elapsed  = utime.ticks_diff(now, self.last_measure_ms)
-
-            if elapsed >= interval:
+            if utime.ticks_diff(now, self.last_measure_ms) >= interval:
                 self.last_measure_ms = now
                 co2, temp, humi = self.read_sensor()
 
@@ -942,7 +829,6 @@ class BusAirMonitor:
                     self.last_humi = humi
                     lvl, _ = evaluate_co2(co2)
 
-                    # ── 측정 중: 데이터 기록 ───────────
                     if self.state in (self.STATE_GAS_MEAS,
                                       self.STATE_HYDRO_MEAS):
                         bus_label = ("가스버스"
@@ -956,36 +842,35 @@ class BusAirMonitor:
                             "humi"    : humi,
                         }
                         self.current_readings.append(record)
-
-                        # 최근 기록 (최대 200개)
                         self.all_recent.append(record)
-                        if len(self.all_recent) > 200:
+
+                        # ★ 메모리 관리: 최대 100개
+                        if len(self.all_recent) > 100:
                             self.all_recent.pop(0)
 
                         count = len(self.current_readings)
-                        print("[" + elapsed_str() + "] "
-                              "#" + zero_pad(count, 4) +
-                              " | CO2:" + str(co2) +
-                              " | T:" + str(temp) +
-                              " | H:" + str(humi) +
-                              " | " + lvl +
-                              " [1초 수집]")
+                        print("#" + zero_pad(count, 4) +
+                              " CO2:" + str(co2) +
+                              " T:"   + str(temp) +
+                              " H:"   + str(humi) +
+                              " " + lvl)
 
-                    # ── 대기 중: 현황만 출력 ───────────
+                        # ★ 50회마다 메모리 정리
+                        if count % 50 == 0:
+                            gc.collect()
+                            print("메모리 정리:", gc.mem_free(), "bytes")
+
                     else:
-                        print("[대기] " + elapsed_str() +
-                              " | CO2:" + str(co2) +
-                              " ppm | " + lvl +
-                              " [15초 수집]")
+                        print("[대기] CO2:" + str(co2) +
+                              " " + lvl)
 
                 self._blink_led()
 
-            # CPU 과부하 방지 (100ms 슬립)
             time.sleep_ms(100)
-
 
 # ============================================================
 # 시작
 # ============================================================
+gc.collect()
 monitor = BusAirMonitor()
 monitor.run()
